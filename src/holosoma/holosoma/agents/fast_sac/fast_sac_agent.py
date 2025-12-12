@@ -280,9 +280,7 @@ class FastSACAgent(BaseAlgo):
             obs_indices=self.critic_obs_indices,
             obs_keys=critic_mlp_obs_keys,
             n_act=n_act,
-            num_atoms=args.num_atoms,
-            v_min=args.v_min,
-            v_max=args.v_max,
+            num_quantiles=args.num_atoms,
             hidden_dim=args.critic_hidden_dim,
             device=device,
             use_layer_norm=args.use_layer_norm,
@@ -301,9 +299,7 @@ class FastSACAgent(BaseAlgo):
             obs_indices=self.critic_obs_indices,
             obs_keys=critic_mlp_obs_keys,
             n_act=n_act,
-            num_atoms=args.num_atoms,
-            v_min=args.v_min,
-            v_max=args.v_max,
+            num_quantiles=args.num_atoms,
             hidden_dim=args.critic_hidden_dim,
             device=device,
             use_layer_norm=args.use_layer_norm,
@@ -402,6 +398,7 @@ class FastSACAgent(BaseAlgo):
         self, data: TensorDict
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         args = self.config
+        device = self.device
 
         scaler = self.scaler
         actor = self.actor
@@ -424,21 +421,89 @@ class FastSACAgent(BaseAlgo):
                 next_state_actions, next_state_log_probs = actor.get_actions_and_log_probs(next_observations)
                 discount = args.gamma ** data["next"]["effective_n_steps"]
 
-                target_distributions = qnet_target.projection(
-                    next_critic_observations,
-                    next_state_actions,
-                    rewards - discount * bootstrap * self.log_alpha.exp() * next_state_log_probs,
-                    bootstrap,
-                    discount,
-                )
-                target_values = qnet_target.get_value(target_distributions)
+                # QR-DQN Target Calculation
+                # Get next state quantiles from target network
+                next_quantiles = qnet_target(next_critic_observations, next_state_actions)  # (num_nets, batch, num_quantiles)
+                
+                # Select the best quantile distribution to avoid overestimation
+                # We take the distribution with the minimum mean value
+                next_q_means = next_quantiles.mean(dim=-1)  # (num_nets, batch)
+                min_idx = next_q_means.argmin(dim=0)  # (batch,)
+                
+                # Gather the selected quantiles
+                # shape: (batch, num_quantiles)
+                selected_next_quantiles = next_quantiles[min_idx, torch.arange(next_quantiles.shape[1], device=device), :]
+                
+                # Apply entropy regularization term
+                # Target Z = r + gamma * (Z' - alpha * log_pi)
+                entropy_term = self.log_alpha.exp() * next_state_log_probs.unsqueeze(-1)
+                target_quantiles = rewards.unsqueeze(-1) + discount.unsqueeze(-1) * bootstrap.unsqueeze(-1) * (selected_next_quantiles - entropy_term)
+                
+                # Calculate target values for logging
+                target_values = target_quantiles.mean(dim=-1)
                 target_value_max = target_values.max()
                 target_value_min = target_values.min()
 
-            q_outputs = qnet(critic_observations, actions)
-            critic_log_probs = F.log_softmax(q_outputs, dim=-1)
-            critic_losses = -torch.sum(target_distributions * critic_log_probs, dim=-1)
-            qf_loss = critic_losses.mean(dim=1).sum(dim=0)
+            # QR-DQN Loss Calculation
+            # Current quantiles: (num_nets, batch, num_quantiles)
+            current_quantiles = qnet(critic_observations, actions)
+            
+            # Compute Quantile Huber Loss
+            # We need pairwise differences: theta_i - T_j
+            # Expand dimensions for broadcasting:
+            # current_quantiles: (num_nets, batch, num_quantiles, 1)
+            # target_quantiles:  (1,        batch, 1,             num_quantiles)
+            
+            num_quantiles = args.num_atoms # Using num_atoms as num_quantiles based on config
+            
+            # Calculate quantile midpoints (tau_hat)
+            # shape: (num_quantiles, 1)
+            tau = torch.arange(num_quantiles, device=device, dtype=torch.float) + 0.5
+            tau /= num_quantiles
+            tau = tau.view(1, num_quantiles).expand(args.batch_size // args.num_updates // self.env.num_envs, -1) # Adjust batch size if needed, but broadcasting handles it
+            
+            # Memory efficient implementation to avoid O(N^2) explosion if possible, 
+            # but standard QR loss requires all pairs.
+            # Let's do it per network to save some memory
+            
+            critic_losses = []
+            for i in range(args.num_q_networks):
+                # (batch, num_quantiles, 1) - (batch, 1, num_quantiles) -> (batch, num_quantiles, num_quantiles)
+                u = target_quantiles.unsqueeze(1) - current_quantiles[i].unsqueeze(2)
+                
+                # Huber loss
+                # huber_loss = 0.5 * u^2 if |u| <= k else k * (|u| - 0.5 * k)
+                # default k=1.0 (kappa)
+                huber_loss = F.huber_loss(u, torch.zeros_like(u), reduction='none', delta=1.0)
+                
+                # Quantile regression loss
+                # rho_tau(u) = |tau - I(u < 0)| * huber_loss(u)
+                # I(u < 0) is 1 if error is negative (target < current), meaning current is overestimating
+                
+                # tau shape needs to be broadcastable to (batch, num_quantiles, num_quantiles)
+                # The tau corresponds to the 'current' quantiles index (i), so it should be (1, num_quantiles, 1)
+                tau_i = (torch.arange(num_quantiles, device=device, dtype=torch.float) + 0.5) / num_quantiles
+                tau_i = tau_i.view(1, num_quantiles, 1)
+                
+                weight = torch.abs(tau_i - (u.detach() < 0).float())
+                element_wise_loss = weight * huber_loss
+                
+                # Sum over target quantiles (j), mean over current quantiles (i) -> (batch,)
+                # Actually standard definition sums over both?
+                # "Sum over j, mean over i" or "Sum over both"?
+                # Paper: sum over j (targets), sum over i (currents)? No, usually mean over i.
+                # Let's follow standard implementations: sum over atoms, mean over batch.
+                # We sum over target quantiles (dim 2) and mean/sum over current quantiles (dim 1).
+                # Usually we want the loss to be scale-invariant w.r.t number of quantiles?
+                # SB3 uses sum over both.
+                # CleanRL uses mean over both?
+                # Let's use sum over both to match magnitude of C51 loss roughly?
+                # Or mean over current, sum over target.
+                
+                loss = element_wise_loss.sum(dim=2).mean(dim=1)
+                critic_losses.append(loss)
+            
+            qf_loss = torch.stack(critic_losses).sum(dim=0).mean()
 
         q_optimizer.zero_grad(set_to_none=True)
         scaler.scale(qf_loss).backward()
