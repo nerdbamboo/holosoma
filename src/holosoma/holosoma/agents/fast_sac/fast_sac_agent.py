@@ -430,9 +430,12 @@ class FastSACAgent(BaseAlgo):
                 next_q_means = next_quantiles.mean(dim=-1)  # (num_nets, batch)
                 min_idx = next_q_means.argmin(dim=0)  # (batch,)
                 
-                # Gather the selected quantiles
-                # shape: (batch, num_quantiles)
-                selected_next_quantiles = next_quantiles[min_idx, torch.arange(next_quantiles.shape[1], device=device), :]
+                # Gather the selected quantiles (compile-friendly / shape-safe)
+                # min_idx: (batch,) -> (1, batch, 1) -> expand to (1, batch, num_quantiles)
+                bsz = next_quantiles.shape[1]
+                n_q = next_quantiles.shape[2]
+                gather_idx = min_idx.view(1, bsz, 1).expand(1, bsz, n_q)
+                selected_next_quantiles = next_quantiles.gather(0, gather_idx).squeeze(0)  # (batch, num_quantiles)
                 
                 # Apply entropy regularization term
                 # Target Z = r + gamma * (Z' - alpha * log_pi)
@@ -454,17 +457,8 @@ class FastSACAgent(BaseAlgo):
             # current_quantiles: (num_nets, batch, num_quantiles, 1)
             # target_quantiles:  (1,        batch, 1,             num_quantiles)
             
-            num_quantiles = args.num_atoms # Using num_atoms as num_quantiles based on config
-            
-            # Calculate quantile midpoints (tau_hat)
-            # shape: (num_quantiles, 1)
-            tau = torch.arange(num_quantiles, device=device, dtype=torch.float) + 0.5
-            tau /= num_quantiles
-            tau = tau.view(1, num_quantiles).expand(args.batch_size // args.num_updates // self.env.num_envs, -1) # Adjust batch size if needed, but broadcasting handles it
-            
-            # Memory efficient implementation to avoid O(N^2) explosion if possible, 
-            # but standard QR loss requires all pairs.
-            # Let's do it per network to save some memory
+            tau_i = (torch.arange(num_quantiles, device=device, dtype=torch.float) + 0.5) / num_quantiles
+            tau_i = tau_i.view(1, num_quantiles, 1)  # (1, N, 1)
             
             critic_losses = []
             for i in range(args.num_q_networks):
@@ -480,27 +474,11 @@ class FastSACAgent(BaseAlgo):
                 # rho_tau(u) = |tau - I(u < 0)| * huber_loss(u)
                 # I(u < 0) is 1 if error is negative (target < current), meaning current is overestimating
                 
-                # tau shape needs to be broadcastable to (batch, num_quantiles, num_quantiles)
-                # The tau corresponds to the 'current' quantiles index (i), so it should be (1, num_quantiles, 1)
-                tau_i = (torch.arange(num_quantiles, device=device, dtype=torch.float) + 0.5) / num_quantiles
-                tau_i = tau_i.view(1, num_quantiles, 1)
-                
                 weight = torch.abs(tau_i - (u.detach() < 0).float())
                 element_wise_loss = weight * huber_loss
                 
-                # Sum over target quantiles (j), mean over current quantiles (i) -> (batch,)
-                # Actually standard definition sums over both?
-                # "Sum over j, mean over i" or "Sum over both"?
-                # Paper: sum over j (targets), sum over i (currents)? No, usually mean over i.
-                # Let's follow standard implementations: sum over atoms, mean over batch.
-                # We sum over target quantiles (dim 2) and mean/sum over current quantiles (dim 1).
-                # Usually we want the loss to be scale-invariant w.r.t number of quantiles?
-                # SB3 uses sum over both.
-                # CleanRL uses mean over both?
-                # Let's use sum over both to match magnitude of C51 loss roughly?
-                # Or mean over current, sum over target.
-                
-                loss = element_wise_loss.sum(dim=2).mean(dim=1)
+                # Normalize the pairwise loss to avoid gradient blow-up with large N (e.g., 101)
+                loss = element_wise_loss.mean(dim=2).mean(dim=1)  # (batch,)
                 critic_losses.append(loss)
             
             qf_loss = torch.stack(critic_losses).sum(dim=0).mean()
@@ -567,9 +545,10 @@ class FastSACAgent(BaseAlgo):
                 policy_entropy = -log_probs.mean()
 
             q_outputs = qnet(critic_observations, actions)
-            q_probs = F.softmax(q_outputs, dim=-1)
-            q_values = qnet.get_value(q_probs)
-            qf_value = q_values.mean(dim=0)
+            # IMPORTANT: QR critic outputs are quantile VALUES (real numbers), not probabilities.
+            # get_value() already means over quantiles. (fast_sac.py Critic.get_value)
+            q_values = qnet.get_value(q_outputs)          # (num_nets, batch)
+            qf_value = q_values.min(dim=0).values         # (batch,)  use min like SAC/TD3
             actor_loss = (self.log_alpha.exp().detach() * log_probs - qf_value).mean()
 
         actor_optimizer.zero_grad(set_to_none=True)
