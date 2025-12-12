@@ -232,6 +232,20 @@ class QuantileQNetwork(nn.Module):
             nn.Linear(hidden_dim // 4, num_quantiles, device=device),
         )
         self.num_quantiles = num_quantiles
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight, gain=1.414)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        
+        # Initialize the last layer with smaller weights to keep initial outputs close to 0
+        # This is the last layer in self.net
+        if isinstance(m, nn.Linear) and m == self.net[-1]:
+             nn.init.orthogonal_(m.weight, gain=1.0)
+             if m.bias is not None:
+                 nn.init.constant_(m.bias, 0)
 
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         x = torch.cat([obs, actions], 1)

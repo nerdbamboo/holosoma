@@ -275,7 +275,7 @@ class FastSACConfig:
     num_q_networks: int = 2
     """number of Q-networks to ensemble"""
 
-    max_grad_norm: float = 0.0
+    max_grad_norm: float = 1.0
     """the maximum gradient norm"""
 
     amp: bool = True
